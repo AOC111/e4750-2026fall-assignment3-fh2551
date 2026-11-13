@@ -177,6 +177,7 @@ __global__ void bmm_naive(
     float Cvalue = 0;
     
     if (x<M && y<N && z<batch){
+        // One thread accumulates one output across K, reading both operands from global memory each time.
         for(int d=0; d<K; d++){
             Cvalue += A[z*M*K + x*K + d] * B[z*K*N + d*N + y];
         }
@@ -209,21 +210,25 @@ __global__ void bmm_optimized(
     int Col = bx * blockDim.x + tx;
     float Cvalue = 0;
     
+    // Sweep K in tiles so each loaded value can serve multiple output elements.
     for (int t=0; t<(K+TILE-1) / TILE; t++){
-    // loop over tiles
+        // tx advances along K, giving neighboring lanes consecutive A loads.
         if (Row<M && t*TILE + tx < K)
             ds_A[ty][tx] = A[bz*M*K + Row*K + t*TILE + tx];
         else
             ds_A[ty][tx] = 0.0f;
+        // tx advances along N, giving neighboring lanes consecutive B loads.
         if (Col<N && t*TILE + ty < K)
             ds_B[ty][tx] = B[bz*K*N + (t*TILE+ty)*N + Col];
         else
             ds_B[ty][tx] = 0.0f;
+        // All lanes must finish loading before the tile is used.
         __syncthreads();
+        // Each thread reuses both on-chip tiles for TILE products of its output.
         for (int i=0; i<TILE; i++){
-        // loop over TILE
             Cvalue += ds_A[ty][i] * ds_B[i][tx];
         }
+        // Wait until every lane is done before overwriting the shared tiles.
         __syncthreads();
     } // End for (int t = 0...
     if (Row<M && Col<N && bz<batch)
@@ -319,6 +324,7 @@ class cudaModule:
         # ============ STUDENT CODE STARTS HERE ============
         [total_start, total_end, kernel_start, kernel_end] = [cuda.Event() for _ in range(4)]
 
+        # The naive mapping assigns x to output rows and z to independent matrices.
         grid_size = ((M-1)//self.naive_block[0] + 1, (N-1)//self.naive_block[1] + 1, batch)
 
         total_start.record()
@@ -393,6 +399,7 @@ class cudaModule:
         [total_start, total_end, kernel_start, kernel_end] = [cuda.Event() for _ in range(4)]
 
         block_size = (tile, tile, 1)
+        # The tiled mapping assigns x to columns so neighboring lanes load adjacent B values.
         grid_size = ((N - 1) // block_size[0] + 1, (M - 1) // block_size[1] + 1, batch)
 
         total_start.record()
@@ -405,6 +412,7 @@ class cudaModule:
         cuda.memcpy_htod(B_gpu, B)
 
         kernel_start.record()
+        # Use the kernel compiled for this tile, since TILE sizes the shared arrays at compile time.
         self.tiled_kernels[tile](C_gpu, A_gpu, B_gpu, batch_u, M_u, K_u, N_u, block=block_size, grid=grid_size)
         kernel_end.record()
 

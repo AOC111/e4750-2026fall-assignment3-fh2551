@@ -176,6 +176,7 @@ __kernel void bmm_naive(
     float Cvalue = 0;
     
     if (x<M && y<N && z<batch){
+        // One work-item accumulates one output across K, reading both operands from global memory each time.
         for(int d=0; d<K; d++){
             Cvalue += A[z*M*K + x*K + d] * B[z*K*N + d*N + y];
         }
@@ -209,21 +210,25 @@ __kernel void bmm_optimized(
     int Col = get_global_id(0);
     float Cvalue = 0;
     
+    // Sweep K in tiles so each loaded value can serve multiple output elements.
     for (int t=0; t<(K+TILE-1) / TILE; t++){
-    // loop over tiles
+        // tx advances along K, giving neighboring lanes consecutive A loads.
         if (Row<M && t*TILE + tx < K)
             ds_A[ty][tx] = A[bz*M*K + Row*K + t*TILE + tx];
         else
             ds_A[ty][tx] = 0.0f;
+        // tx advances along N, giving neighboring lanes consecutive B loads.
         if (Col<N && t*TILE + ty < K)
             ds_B[ty][tx] = B[bz*K*N + (t*TILE+ty)*N + Col];
         else
             ds_B[ty][tx] = 0.0f;
+        // Every work-item must finish loading before the tile is used.
         barrier(CLK_LOCAL_MEM_FENCE);
+        // Each work-item reuses both local tiles for TILE products of its output.
         for (int i=0; i<TILE; i++){
-        // loop over TILE
             Cvalue += ds_A[ty][i] * ds_B[i][tx];
         }
+        // Wait until every work-item is done before overwriting the local tiles.
         barrier(CLK_LOCAL_MEM_FENCE);
     } // End for (int t = 0...
     if (Row<M && Col<N && bz<batch)
@@ -330,6 +335,7 @@ class clModule:
                                   np.uint32(K), np.uint32(N))
 
         # ============ STUDENT CODE STARTS HERE ============
+        # Round up the row dimension to complete work groups; boundary checks discard excess work-items.
         global_size = (((M-1) // self.naive_local[0] + 1) * self.naive_local[0],
                        ((N-1) // self.naive_local[1] + 1) * self.naive_local[1], batch)
 
@@ -403,6 +409,7 @@ class clModule:
 
         # ============ STUDENT CODE STARTS HERE ============
         local_size = (tile, tile, 1)
+        # Put columns on dimension 0 for adjacent B loads and round up partial tiles.
         global_size = (((N - 1) // local_size[0] + 1) * local_size[0],
                        ((M - 1) // local_size[1] + 1) * local_size[1], batch)
 
@@ -415,6 +422,7 @@ class clModule:
         C = np.empty((batch, M, N), dtype=np.float32)
         C_buffer = cl.Buffer(self.ctx, mf.WRITE_ONLY, C.nbytes)
 
+        # Select the program built with this compile-time TILE value.
         evt = self.tiled_kernels[tile](self.queue, global_size, local_size, C_buffer, A_buffer, B_buffer,
                                  batch_u, M_u, K_u, N_u)
         evt.wait()
